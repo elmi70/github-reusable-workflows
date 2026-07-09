@@ -19,9 +19,6 @@ on:
         type: string
         default: 'docs: auto-update README.md [skip ci]'
 
-permissions:
-  contents: write
-
 jobs:
   docs:
     runs-on: ubuntu-latest
