@@ -1,0 +1,312 @@
+name: Terraform Destroy (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: 'Terraform working directory relative to repo root, e.g. ./infra'
+        required: true
+        type: string
+      location:
+        description: 'Azure region for state backend resources'
+        required: false
+        type: string
+        default: westeurope
+      terraform_state_rg:
+        description: 'Resource group that holds the Terraform state storage account'
+        required: true
+        type: string
+      terraform_state_storage:
+        description: 'Storage account name for Terraform state'
+        required: true
+        type: string
+      terraform_state_container:
+        description: 'Blob container name for Terraform state'
+        required: false
+        type: string
+        default: tfstate
+      terraform_state_key:
+        description: 'State file key within the container, e.g. dns.tfstate'
+        required: true
+        type: string
+      confirm_destroy:
+        description: 'Must be the string "DESTROY" to proceed'
+        required: true
+        type: string
+      resource_name:
+        description: 'Name of the resource being destroyed — verified against Terraform state output "cluster_name"'
+        required: true
+        type: string
+      destroy_artifact_name:
+        description: 'Artifact name for the saved destroy plan'
+        required: false
+        type: string
+        default: terraform-destroy-plan
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      GH_MODULE_TOKEN:
+        required: true
+
+jobs:
+  validate-destroy-inputs:
+    name: Validate Destruction Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      validation_passed: ${{ steps.validate.outputs.passed }}
+    steps:
+      - name: Validate Inputs
+        id: validate
+        run: |
+          if [ "${{ inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "❌ Invalid confirmation. You must type 'DESTROY' exactly."
+            echo "   Current input: '${{ inputs.confirm_destroy }}'"
+            exit 1
+          fi
+
+          if [ -z "${{ inputs.resource_name }}" ]; then
+            echo "❌ resource_name cannot be empty"
+            exit 1
+          fi
+
+          echo "✅ All validations passed"
+          echo "🎯 Target resource: ${{ inputs.resource_name }}"
+          echo "passed=true" >> $GITHUB_OUTPUT
+
+  setup-terraform-backend:
+    name: Verify Terraform Backend
+    runs-on: ubuntu-latest
+    needs: validate-destroy-inputs
+    if: needs.validate-destroy-inputs.outputs.validation_passed == 'true'
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Terraform State Storage Exists
+        uses: azure/cli@v3
+        with:
+          azcliversion: latest
+          inlineScript: |
+            if ! az storage account show \
+                --name ${{ inputs.terraform_state_storage }} \
+                --resource-group ${{ inputs.terraform_state_rg }} &>/dev/null; then
+              echo "❌ State storage '${{ inputs.terraform_state_storage }}' not found in '${{ inputs.terraform_state_rg }}'"
+              echo "Infrastructure may never have been created or was already destroyed."
+              exit 1
+            fi
+            echo "✅ Terraform state storage verified"
+
+  verify-existing-infrastructure:
+    name: Verify Infrastructure Exists
+    runs-on: ubuntu-latest
+    needs: setup-terraform-backend
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    outputs:
+      infrastructure_exists: ${{ steps.check.outputs.exists }}
+      resource_found: ${{ steps.check.outputs.resource_found }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set ARM environment variables
+        run: |
+          echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
+          echo "ARM_USE_AZUREAD=true" >> $GITHUB_ENV
+
+      - name: Setup Terraform and git credentials
+        uses: elmi70/github-reusable-workflows/.github/actions/terraform-setup@main
+        with:
+          github-token: ${{ secrets.GH_MODULE_TOKEN }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ inputs.terraform_state_rg }}" \
+            -backend-config="storage_account_name=${{ inputs.terraform_state_storage }}" \
+            -backend-config="container_name=${{ inputs.terraform_state_container }}" \
+            -backend-config="key=${{ inputs.terraform_state_key }}" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Check Infrastructure State
+        id: check
+        run: |
+          RESOURCE_COUNT=$(terraform state list | wc -l)
+          echo "📊 Resources in state: $RESOURCE_COUNT"
+
+          if [ "$RESOURCE_COUNT" -gt 0 ]; then
+            echo "✅ Infrastructure found ($RESOURCE_COUNT resources)"
+            echo "exists=true" >> $GITHUB_OUTPUT
+
+            CURRENT_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "unknown")
+            echo "📋 Resource in state: $CURRENT_NAME"
+
+            if [ "$CURRENT_NAME" == "${{ inputs.resource_name }}" ]; then
+              echo "✅ Resource name matches"
+              echo "resource_found=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️  Name mismatch — state: $CURRENT_NAME, input: ${{ inputs.resource_name }}"
+              echo "resource_found=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "ℹ️  No infrastructure found in Terraform state"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "resource_found=false" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-destroy-plan:
+    name: Plan Destruction
+    runs-on: ubuntu-latest
+    needs: [setup-terraform-backend, verify-existing-infrastructure]
+    if: needs.verify-existing-infrastructure.outputs.infrastructure_exists == 'true'
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set ARM environment variables
+        run: |
+          echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
+          echo "ARM_USE_AZUREAD=true" >> $GITHUB_ENV
+
+      - name: Setup Terraform and git credentials
+        uses: elmi70/github-reusable-workflows/.github/actions/terraform-setup@main
+        with:
+          github-token: ${{ secrets.GH_MODULE_TOKEN }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ inputs.terraform_state_rg }}" \
+            -backend-config="storage_account_name=${{ inputs.terraform_state_storage }}" \
+            -backend-config="container_name=${{ inputs.terraform_state_container }}" \
+            -backend-config="key=${{ inputs.terraform_state_key }}" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Destroy Plan
+        run: |
+          terraform plan -destroy -no-color -out=destroy-plan.tfplan -input=false
+          terraform show destroy-plan.tfplan | grep -E "(Plan:|will be destroyed)" || true
+
+      - name: Upload Destroy Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.destroy_artifact_name }}
+          path: ${{ inputs.working_directory }}/destroy-plan.tfplan
+          retention-days: 1
+
+  execute-destruction:
+    name: Execute Infrastructure Destruction
+    runs-on: ubuntu-latest
+    needs: [setup-terraform-backend, terraform-destroy-plan, verify-existing-infrastructure]
+    if: needs.verify-existing-infrastructure.outputs.infrastructure_exists == 'true'
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set ARM environment variables
+        run: |
+          echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
+          echo "ARM_USE_AZUREAD=true" >> $GITHUB_ENV
+
+      - name: Setup Terraform and git credentials
+        uses: elmi70/github-reusable-workflows/.github/actions/terraform-setup@main
+        with:
+          github-token: ${{ secrets.GH_MODULE_TOKEN }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ inputs.terraform_state_rg }}" \
+            -backend-config="storage_account_name=${{ inputs.terraform_state_storage }}" \
+            -backend-config="container_name=${{ inputs.terraform_state_container }}" \
+            -backend-config="key=${{ inputs.terraform_state_key }}" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Download Destroy Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.destroy_artifact_name }}
+          path: ${{ inputs.working_directory }}
+
+      - name: Final Warning
+        run: |
+          echo "🚨 INFRASTRUCTURE DESTRUCTION STARTING 🚨"
+          echo "Resource: ${{ inputs.resource_name }}"
+          echo "Requested by: ${{ github.actor }}"
+          echo "Timestamp: $(date -u)"
+
+      - name: Execute Terraform Destroy
+        run: terraform apply -auto-approve destroy-plan.tfplan
+
+      - name: Verify Destruction
+        run: |
+          RESOURCE_COUNT=$(terraform show -json | jq '.values.root_module.resources | length' 2>/dev/null || echo "0")
+          if [ "$RESOURCE_COUNT" -eq 0 ]; then
+            echo "✅ All resources successfully destroyed"
+          else
+            echo "⚠️  Warning: $RESOURCE_COUNT resources may still exist — check state manually"
+          fi
+
+      - name: Destruction Summary
+        run: |
+          echo "🏁 DESTRUCTION COMPLETED"
+          echo "Resource: ${{ inputs.resource_name }}"
+          echo "Destroyed by: ${{ github.actor }}"
+          echo "Completed at: $(date -u)"
+
+  no-infrastructure-found:
+    name: No Infrastructure to Destroy
+    runs-on: ubuntu-latest
+    needs: verify-existing-infrastructure
+    if: needs.verify-existing-infrastructure.outputs.infrastructure_exists == 'false'
+    steps:
+      - name: Report No Infrastructure
+        run: |
+          echo "ℹ️  No Infrastructure Found"
+          echo "Terraform state shows no resources to destroy for: ${{ inputs.resource_name }}"
+          echo "✅ No action needed"

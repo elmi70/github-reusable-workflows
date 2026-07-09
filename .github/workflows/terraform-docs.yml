@@ -1,0 +1,40 @@
+name: Terraform Docs (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      working_dir:
+        description: 'Directory containing the Terraform files to document'
+        required: false
+        type: string
+        default: infra
+      output_file:
+        description: 'File to write generated docs into'
+        required: false
+        type: string
+        default: README.md
+      commit_message:
+        description: 'Git commit message for the auto-generated docs update'
+        required: false
+        type: string
+        default: 'docs: auto-update README.md [skip ci]'
+
+permissions:
+  contents: write
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Generate Terraform docs
+        uses: terraform-docs/gh-actions@v1.3.0
+        with:
+          working-dir: ${{ inputs.working_dir }}
+          output-file: ${{ inputs.output_file }}
+          output-method: inject
+          git-push: "true"
+          git-commit-message: ${{ inputs.commit_message }}

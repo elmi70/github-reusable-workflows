@@ -1,0 +1,17 @@
+name: Terraform Setup
+description: 'Install Terraform and configure git credentials for private modules'
+
+inputs:
+  github-token:
+    description: 'GitHub PAT for downloading private Terraform modules'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v4
+
+    - name: Configure git for private modules
+      shell: bash
+      run: git config --global url."https://${{ inputs.github-token }}@github.com/".insteadOf "https://github.com/"
