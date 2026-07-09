@@ -115,7 +115,7 @@ jobs:
       infrastructure_exists: ${{ steps.check.outputs.exists }}
       resource_found: ${{ steps.check.outputs.resource_found }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -182,7 +182,7 @@ jobs:
       run:
         working-directory: ${{ inputs.working_directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -235,7 +235,7 @@ jobs:
       run:
         working-directory: ${{ inputs.working_directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Login to Azure
         uses: azure/login@v3
