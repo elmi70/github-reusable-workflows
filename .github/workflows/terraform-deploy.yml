@@ -49,6 +49,11 @@ on:
         required: false
         type: boolean
         default: false
+      verify_graph_permissions:
+        description: 'Set to true to verify Graph API permissions (needed for AKS/AD group access, not for most repos)'
+        required: false
+        type: boolean
+        default: false
     secrets:
       AZURE_CLIENT_ID:
         required: true
@@ -137,9 +142,11 @@ jobs:
               && echo "✅ Azure resource permissions OK" \
               || { echo "❌ Missing Azure resource permissions"; exit 1; }
 
-            az ad group list --query "[0:1].displayName" -o tsv &>/dev/null \
-              && echo "✅ Graph API permissions OK" \
-              || { echo "❌ Missing Graph API permissions (need Group.Read.All or Directory.Read.All)"; exit 1; }
+            if [ "${{ inputs.verify_graph_permissions }}" = "true" ]; then
+              az ad group list --query "[0:1].displayName" -o tsv &>/dev/null \
+                && echo "✅ Graph API permissions OK" \
+                || { echo "❌ Missing Graph API permissions (need Group.Read.All or Directory.Read.All)"; exit 1; }
+            fi
 
       - name: Setup Terraform and git credentials
         uses: elmi70/github-reusable-workflows/.github/actions/terraform-setup@main
