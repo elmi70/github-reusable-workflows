@@ -54,6 +54,11 @@ on:
         required: false
         type: boolean
         default: false
+      terraform_vars:
+        description: 'Additional Terraform variables as a JSON object — each key becomes TF_VAR_<key>'
+        required: false
+        type: string
+        default: '{}'
     secrets:
       AZURE_CLIENT_ID:
         required: true
@@ -172,6 +177,11 @@ jobs:
         id: validate
         run: terraform validate -no-color
 
+      - name: Set Terraform variables
+        if: inputs.terraform_vars != '{}'
+        run: |
+          echo '${{ inputs.terraform_vars }}' | jq -r 'to_entries[] | "TF_VAR_\(.key)=\(.value)"' >> $GITHUB_ENV
+
       - name: Terraform Plan
         id: plan
         run: terraform plan -no-color -out=tfplan -input=false
@@ -276,6 +286,11 @@ jobs:
         with:
           name: ${{ inputs.plan_artifact_name }}
           path: ${{ inputs.working_directory }}
+
+      - name: Set Terraform variables
+        if: inputs.terraform_vars != '{}'
+        run: |
+          echo '${{ inputs.terraform_vars }}' | jq -r 'to_entries[] | "TF_VAR_\(.key)=\(.value)"' >> $GITHUB_ENV
 
       - name: Terraform Apply
         run: terraform apply -auto-approve -input=false tfplan
